@@ -429,7 +429,7 @@ int main(int argc, char *argv[])
 	signal(SIGPIPE, signal_handler);
 
 	option = 0;
-	while ((option = getopt(argc, argv, "c:kfhd")) != -1)
+	while ((option = getopt(argc, argv, "c:kfhdr:")) != -1)
 	{
 		switch (option)
 		{
@@ -437,7 +437,7 @@ int main(int argc, char *argv[])
 				channel = (uint8_t)atoi(optarg);
 				if (channel < 11 || channel > 26)
 				{
-					
+					printf("ERROR: Invalid channel (use channel 11-26).\n");
 					exit(EXIT_FAILURE);
 				}
 				break;
