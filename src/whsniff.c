@@ -514,7 +514,7 @@ int main(int argc, char *argv[])
 	static unsigned char recv_buf[2 * BUF_SIZE];
 	static int recv_cnt;
     static int packet_cnt;
-    char *file_prefix;
+    char *file_prefix = 0;
 
 	FILE * file = NULL;
 
