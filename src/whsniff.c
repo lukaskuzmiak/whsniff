@@ -239,7 +239,7 @@ void print_usage()
     printf("\t-f <prefix>  - Dump to file (handy for long sniffs with -h/-d options)\n");
     printf("\t-h           - Start a new dump file evey hour (used with -f)\n");
     printf("\t-d           - Start a new dump file evey day (used with -f)\n");
-    printf("\t-k           - Keep the original FCS sent by the CC2531\n");
+    printf("\t-k           - DO NOT keep the original FCS sent by the CC2531\n");
     printf("\t-r <seconds> - Roll to the next channel after <seconds> seconds\n");
     
 }
@@ -504,7 +504,7 @@ int main(int argc, char *argv[])
 {
 	uint8_t channel = 0;
     uint8_t stdout_pipe = 0;
-	uint8_t keep_original_fcs = 0;
+	uint8_t keep_original_fcs = 1;
 	uint8_t restart_hourly = 0;
 	uint8_t restart_daily = 0;
     uint8_t roll_after_sec = 0;
@@ -539,7 +539,7 @@ int main(int argc, char *argv[])
 				}
 				break;
 			case 'k':
-				keep_original_fcs = 1;
+				keep_original_fcs = 0;
 				break;
 			case 'f':
                 file_prefix = strdup(optarg);
