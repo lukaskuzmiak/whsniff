@@ -100,7 +100,7 @@ static uint16_t ieee802154_crc16(uint8_t *tvb, uint32_t offset, uint32_t len);
 
 
 //--------------------------------------------
-static int packet_handler(unsigned char *buf, int cnt, uint8_t keep_original_fcs, FILE * file)
+static int packet_handler(unsigned char *buf, int cnt, uint8_t keep_original_fcs, FILE * file, int *packet_cnt)
 {
 	usb_header_type *usb_header;
 	usb_data_header_type *usb_data_header;
@@ -171,6 +171,9 @@ static int packet_handler(unsigned char *buf, int cnt, uint8_t keep_original_fcs
 			// Bit 6-0: If Correlation used: Correlation value.
 			// If Correlation not used: LQI.
 
+            if (usb_data_header->wpan_len > 0)
+                (*packet_cnt)++;
+
 			if (keep_original_fcs)
 				fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len, file);
 			else
@@ -222,8 +225,48 @@ void print_usage()
     printf("\t-f - dump to file instead of stdout (handy for long sniffs with -h/-d options)\n");
     printf("\t-h - start a new dump file evey hour (used with -f)\n");
     printf("\t-d - start a new dump file evey day (used with -f)\n");
+    printf("\t-r <seconds> - roll to the next channel after <seconds> seconds\n");
 }
 
+int check_libusb_err(int res) {
+    if (res < 0)
+        fprintf(stderr, "libusb_control_transfer error: %s", libusb_error_name(res));
+    return res;
+}
+
+int change_channel_usb_sniffer(libusb_device_handle *handle, uint8_t channel, u_int8_t restart) {
+	int res;
+    static unsigned char usb_buf[BUF_SIZE];
+
+    if(restart) {
+        // Stop sniffing
+        res = libusb_control_transfer(handle, 0x40, 209, 0, 0, NULL, 0, TIMEOUT);
+        if(check_libusb_err(res) < 0)
+            return res;
+    }
+
+    // set channel command
+	usb_buf[0] = channel;
+	res = libusb_control_transfer(handle, 0x40, 210, 0, 0, (unsigned char *)&usb_buf, 1, TIMEOUT);
+    if(check_libusb_err(res) < 0)
+        return res;
+
+    usb_buf[0] = 0x00;
+	res = libusb_control_transfer(handle, 0x40, 210, 0, 1, (unsigned char *)&usb_buf, 1, TIMEOUT);
+    if(check_libusb_err(res) < 0)
+        return res;
+
+    if(restart) {
+        // Start sniffing again
+        res = libusb_control_transfer(handle, 0x40, 208, 0, 0, NULL, 0, TIMEOUT);
+        if(check_libusb_err(res) < 0)
+            return res;
+    }
+
+    fprintf(stderr, "SET CH %d\n", channel);
+
+    return 0;
+}
 
 //--------------------------------------------
 libusb_device_handle * init_usb_sniffer(uint8_t channel)
@@ -307,27 +350,39 @@ libusb_device_handle * init_usb_sniffer(uint8_t channel)
 
 	// get identity from firmware command
 	res = libusb_control_transfer(handle, 0xc0, 192, 0, 0, (unsigned char *)&usb_buf, BUF_SIZE, TIMEOUT);
+    if(check_libusb_err(res) < 0)
+        return NULL;
+
 	// power on radio, wIndex = 4
 	res = libusb_control_transfer(handle, 0x40, 197, 0, 4, NULL, 0, TIMEOUT);
+    if(check_libusb_err(res) < 0)
+        return NULL;
+
 	// check if powered up
 	for (;;)
 	{
 		res = libusb_control_transfer(handle, 0xc0, 198, 0, 0, (unsigned char *)&usb_buf, 1, TIMEOUT);
+        if(check_libusb_err(res) < 0)
+            return NULL;
 		if (usb_buf[0] == 0x04)
 			break;
 		usleep(10000);
 	}
+
 	// unknown command
 	res = libusb_control_transfer(handle, 0x40, 201, 0, 0, NULL, 0, TIMEOUT);
+    if(check_libusb_err(res) < 0)
+        return NULL;
 
-	// set channel command
-	usb_buf[0] = channel;
-	res = libusb_control_transfer(handle, 0x40, 210, 0, 0, (unsigned char *)&usb_buf, 1, TIMEOUT);
-	usb_buf[0] = 0x00;
-	res = libusb_control_transfer(handle, 0x40, 210, 0, 1, (unsigned char *)&usb_buf, 1, TIMEOUT);
+    // change channel
+    res = change_channel_usb_sniffer(handle, channel, 0);
+    if(check_libusb_err(res) < 0)
+        return NULL;
 
 	// start sniffing
 	res = libusb_control_transfer(handle, 0x40, 208, 0, 0, NULL, 0, TIMEOUT);
+    if(check_libusb_err(res) < 0)
+        return NULL;
 
 	return handle;
 }
@@ -339,20 +394,57 @@ void close_usb_sniffer(libusb_device_handle *handle)
 
 	// stop sniffing
 	res = libusb_control_transfer(handle, 0x40, 209, 0, 0, NULL, 0, TIMEOUT);
+    check_libusb_err(res);
+
 	// power off radio, wIndex = 0
 	res = libusb_control_transfer(handle, 0x40, 197, 0, 0, NULL, 0, TIMEOUT);
+    check_libusb_err(res);
 
 	// clearing
 	res = libusb_release_interface(handle, 0);
+    check_libusb_err(res);
+
 	libusb_close(handle);
 	libusb_exit(NULL);
 }
 
+void print_captured_packets(uint8_t channel, int *packet_cnt) {
+        fprintf(stderr, "CH %d -> pkts: %d\n", channel, *packet_cnt);
+        *packet_cnt = 0; // reset the counter
+}
+
+uint8_t roll_channel(libusb_device_handle *handle, uint8_t roll_after_sec, uint8_t channel, int *packet_cnt) {
+    static time_t last_roll;
+
+    // Init last_roll to avoid rolling immediately after start
+    if(!last_roll)
+        last_roll = time(NULL);
+
+    time_t t = time(NULL);
+
+    if(roll_after_sec && last_roll + roll_after_sec <= t) {
+        // Print stats
+        print_captured_packets(channel, packet_cnt);
+
+        // Store last restart
+        last_roll = t;
+
+        // Roll channel
+        channel++;
+        if(channel > 26)
+            channel = 11;
+
+        // Change the channel in the device
+        change_channel_usb_sniffer(handle, channel, 1);
+    }
+    return channel;
+}
+
 //--------------------------------------------
-FILE * restart_pcap_file(FILE * prev_file, uint8_t restart_hourly, uint8_t restart_daily)
+FILE * restart_pcap_file(FILE * prev_file, uint8_t restart_hourly, uint8_t restart_daily, uint8_t channel, int *packet_cnt)
 {
-	static int last_hour = -1;
-	static int last_day = -1;
+	static time_t last_restart = -1;
+    static int last_channel = -1;
 	static int stdout_header_written = 0;
 
 	FILE * file = prev_file;
@@ -373,36 +465,39 @@ FILE * restart_pcap_file(FILE * prev_file, uint8_t restart_hourly, uint8_t resta
 	}
 
 	time_t t = time(NULL);
-	struct tm tm = *localtime(&t);
 
-	// No need to restart if hour has not yet changed
-	if(restart_hourly && last_hour == tm.tm_hour)
-		return file;
+    if (!file ||
+        restart_daily && last_restart + 86400 <= t ||
+        restart_hourly && last_restart + 3600 <= t ||
+        last_channel != channel
+    ) {
+        // Close previous file if open
+        if (file) {
+            fclose(file);
 
-	// No need to restart if day has not yet changed
-	if(restart_daily && last_day == tm.tm_mday)
-		return file;
+            // Print stats for restarts (not channel change)
+            if(last_channel == channel)
+                print_captured_packets(channel, packet_cnt);
+        }
+    
+        // Store last restart/channel
+        last_restart = t;
+        last_channel = channel;
 
-	// Store last hour/day
-	last_hour = tm.tm_hour;
-	last_day = tm.tm_mday;
+        // Open new file
+        char filename[100];
+        struct tm tm = *localtime(&t);
+        sprintf(filename, "whsniff-%d-%d-%02d-%02d-%02d-%02d-%02d.pcap", channel, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
 
-	// Close previous file
-	if(file)
-		fclose(file);
+        fprintf(stderr, "Sniffing channel %d to %s\n", channel, filename);
+        file = fopen(filename, "wb");
 
-	// ... and open a new one
-	char filename[100];
-	sprintf(filename, "whsniff-%d-%02d-%02d-%02d-%02d-%02d.pcap", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        // Write PCAP header
+        fwrite(&pcap_hdr, sizeof(pcap_hdr), 1, file);
+        fflush(file);
+    }
 
-	fprintf(stderr, "Sniffing to %s\n", filename);
-	file = fopen(filename, "wb");
-
-	// Write PCAP header
-	fwrite(&pcap_hdr, sizeof(pcap_hdr), 1, file);
-	fflush(file);
-
-	return file;
+    return file;
 }
 
 //--------------------------------------------
@@ -413,11 +508,13 @@ int main(int argc, char *argv[])
 	uint8_t dump_to_file = 0;
 	uint8_t restart_hourly = 0;
 	uint8_t restart_daily = 0;
+    uint8_t roll_after_sec = 0;
 	int option;
 	static unsigned char usb_buf[BUF_SIZE];
 	static int usb_cnt;
 	static unsigned char recv_buf[2 * BUF_SIZE];
 	static int recv_cnt;
+    static int packet_cnt;
 
 	FILE * file = NULL;
 
@@ -453,6 +550,9 @@ int main(int argc, char *argv[])
 			case 'd':
 				restart_daily = 1;
 				break;
+            case 'r':
+                roll_after_sec = (uint8_t)atoi(optarg);
+                break;
 			default:
 				print_usage();
 				exit(EXIT_FAILURE);
@@ -474,8 +574,11 @@ int main(int argc, char *argv[])
 
 	while (!signal_exit)
 	{
+        // roll channel if needed
+        channel = roll_channel(handle, roll_after_sec, channel, &packet_cnt);
+
 		// restart new PCAP file (if needed)
-		file = restart_pcap_file(dump_to_file ? file /*Open new file*/ : stdout, restart_hourly, restart_daily);
+		file = restart_pcap_file(dump_to_file ? file /*Open new file*/ : stdout, restart_hourly, restart_daily, channel, &packet_cnt);
 
 		// Receive and process a piece of data from USB
 		int res = libusb_bulk_transfer(handle, 0x83, (unsigned char *)&usb_buf, BUF_SIZE, &usb_cnt, 10000);
@@ -500,7 +603,7 @@ int main(int argc, char *argv[])
 
 		for (;;)
 		{
-			res = packet_handler(&recv_buf[0], recv_cnt, keep_original_fcs, file);
+			res = packet_handler(&recv_buf[0], recv_cnt, keep_original_fcs, file, &packet_cnt);
 			if (res < 0)
 				break;
 			recv_cnt -= res;
