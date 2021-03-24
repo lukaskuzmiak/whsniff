@@ -100,7 +100,7 @@ static uint16_t ieee802154_crc16(uint8_t *tvb, uint32_t offset, uint32_t len);
 
 
 //--------------------------------------------
-static int packet_handler(unsigned char *buf, int cnt, uint8_t keep_original_fcs, FILE * file, int *packet_cnt)
+static int packet_handler(unsigned char *buf, int cnt, uint8_t keep_original_fcs, FILE * file, uint8_t stdout_pipe, int *packet_cnt)
 {
 	usb_header_type *usb_header;
 	usb_data_header_type *usb_data_header;
@@ -161,7 +161,11 @@ static int packet_handler(unsigned char *buf, int cnt, uint8_t keep_original_fcs
 			pcaprec_hdr.incl_len = (uint32_t)usb_data_header->wpan_len;
 			pcaprec_hdr.orig_len = (uint32_t)usb_data_header->wpan_len;
 
-			fwrite(&pcaprec_hdr, sizeof(pcaprec_hdr), 1, file);
+            if(file)
+			    fwrite(&pcaprec_hdr, sizeof(pcaprec_hdr), 1, file);
+            
+            if(stdout_pipe)
+                fwrite(&pcaprec_hdr, sizeof(pcaprec_hdr), 1, stdout);
 
 			// SmartRF™ Packet Sniffer User’s Manual (SWRU187G)
 			// FCS:
@@ -174,11 +178,17 @@ static int packet_handler(unsigned char *buf, int cnt, uint8_t keep_original_fcs
             if (usb_data_header->wpan_len > 0)
                 (*packet_cnt)++;
 
-			if (keep_original_fcs)
-				fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len, file);
-			else
+			if (keep_original_fcs) {
+                if(file)
+				    fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len, file);
+                if(stdout_pipe)
+                    fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len, stdout);
+            } else
 			{
-				fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len - 2, file);
+                if(file)
+				    fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len - 2, file);
+                if(stdout_pipe)
+                    fwrite(&buf[sizeof(usb_data_header_type)], 1, usb_data_header->wpan_len - 2, stdout);
 				fcs = 0;
 				if (buf[sizeof(usb_data_header_type) + usb_data_header->wpan_len - 1] & 0x80)
 				{
@@ -187,9 +197,15 @@ static int packet_handler(unsigned char *buf, int cnt, uint8_t keep_original_fcs
 				}
 				le_fcs = htole16(fcs);
 
-				fwrite(&le_fcs, sizeof(le_fcs), 1, file);
+                if(file)
+				    fwrite(&le_fcs, sizeof(le_fcs), 1, file);
+                if(stdout_pipe)
+                    fwrite(&le_fcs, sizeof(le_fcs), 1, stdout);
 			}
-			fflush(file);
+            if(file)
+			    fflush(file);
+            if(stdout_pipe)
+                fflush(stdout);
 
 			break;
 
@@ -217,15 +233,15 @@ void signal_handler(int sig)
 //--------------------------------------------
 void print_usage()
 {
-    printf("Usage: whsniff -c <channel> [-k] [-f <prefix>] [-h] [-d] [-r <seconds>]\n");
-    printf("\n");
-    printf("Where\n");
+    printf("Usage: whsniff -c <channel> [-w] [-f <prefix>] [-h] [-d] [-k] [-r <seconds>]\n");
     printf("\t-c <channel> - Zigbee channel number (11 to 26)\n");
-    printf("\t-k - keep the original FCS sent by the CC2531\n");
-    printf("\t-f <prefix> - dump to file instead of stdout (handy for long sniffs with -h/-d options)\n");
-    printf("\t-h - start a new dump file evey hour (used with -f)\n");
-    printf("\t-d - start a new dump file evey day (used with -f)\n");
-    printf("\t-r <seconds> - roll to the next channel after <seconds> seconds\n");
+    printf("\t-w           - Wireshark (pipe to stdout)\n");
+    printf("\t-f <prefix>  - Dump to file (handy for long sniffs with -h/-d options)\n");
+    printf("\t-h           - Start a new dump file evey hour (used with -f)\n");
+    printf("\t-d           - Start a new dump file evey day (used with -f)\n");
+    printf("\t-k           - Keep the original FCS sent by the CC2531\n");
+    printf("\t-r <seconds> - Roll to the next channel after <seconds> seconds\n");
+    
 }
 
 int check_libusb_err(int res) {
@@ -448,22 +464,6 @@ FILE * restart_pcap_file(FILE * prev_file, char* file_prefix, uint8_t restart_ho
 	static int stdout_header_written = 0;
 
 	FILE * file = prev_file;
-
-	// print PCAP header to stdout only once
-	if(file == stdout)
-	{
-		if(!stdout_header_written)
-		{
-			// Write PCAP header
-			fwrite(&pcap_hdr, sizeof(pcap_hdr), 1, file);
-			fflush(file);
-
-			stdout_header_written = 1;
-		}
-		
-		return file;
-	}
-
 	time_t t = time(NULL);
 
     if (!file ||
@@ -503,6 +503,7 @@ FILE * restart_pcap_file(FILE * prev_file, char* file_prefix, uint8_t restart_ho
 int main(int argc, char *argv[])
 {
 	uint8_t channel = 0;
+    uint8_t stdout_pipe = 0;
 	uint8_t keep_original_fcs = 0;
 	uint8_t restart_hourly = 0;
 	uint8_t restart_daily = 0;
@@ -525,7 +526,7 @@ int main(int argc, char *argv[])
 	signal(SIGPIPE, signal_handler);
 
 	option = 0;
-	while ((option = getopt(argc, argv, "c:kf:hdr:")) != -1)
+	while ((option = getopt(argc, argv, "c:kf:hdr:w")) != -1)
 	{
 		switch (option)
 		{
@@ -552,13 +553,16 @@ int main(int argc, char *argv[])
             case 'r':
                 roll_after_sec = (uint8_t)atoi(optarg);
                 break;
+            case 'w':
+                stdout_pipe = 1;
+                break;
 			default:
 				print_usage();
 				exit(EXIT_FAILURE);
 		}
 	}
 	// check the mandatory options
-	if (!channel)
+	if (!channel || !(file_prefix || stdout_pipe))
 	{
 		print_usage();
 		exit(EXIT_FAILURE);
@@ -571,13 +575,20 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
+    if (stdout_pipe) {
+        // Write PCAP header
+		fwrite(&pcap_hdr, sizeof(pcap_hdr), 1, stdout);
+		fflush(stdout);
+    }
+
 	while (!signal_exit)
 	{
         // roll channel if needed
         channel = roll_channel(handle, roll_after_sec, channel, &packet_cnt);
 
 		// restart new PCAP file (if needed)
-		file = restart_pcap_file(file_prefix ? file /*Open new file*/ : stdout, file_prefix, restart_hourly, restart_daily, channel, &packet_cnt);
+        if(file_prefix)
+		    file = restart_pcap_file(file, file_prefix, restart_hourly, restart_daily, channel, &packet_cnt);
 
 		// Receive and process a piece of data from USB
 		int res = libusb_bulk_transfer(handle, 0x83, (unsigned char *)&usb_buf, BUF_SIZE, &usb_cnt, 10000);
@@ -602,7 +613,7 @@ int main(int argc, char *argv[])
 
 		for (;;)
 		{
-			res = packet_handler(&recv_buf[0], recv_cnt, keep_original_fcs, file, &packet_cnt);
+			res = packet_handler(&recv_buf[0], recv_cnt, keep_original_fcs, file, stdout_pipe, &packet_cnt);
 			if (res < 0)
 				break;
 			recv_cnt -= res;
